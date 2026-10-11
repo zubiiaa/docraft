@@ -58,7 +58,6 @@ These files document the project and its implementation:
 
 - `README.md`: Project overview, setup instructions, configuration, and run commands.
 - `ARCHITECTURE.md`: Application architecture, data flow, persistence, and design decisions.
-- `AI_WORKFLOW.md`: AI tools, development workflow, and verification.
 - `SUBMISSION.md`: Feature inventory and implementation status.
 
 Before submission, ensure that the setup instructions, AI workflow details, and test commands accurately reflect the final project.
