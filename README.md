@@ -6,10 +6,14 @@ Docraft is a lightweight collaborative document editor built for a short technic
 
 - Create, rename, delete, and list documents from a workspace dashboard
 - Rich-text editing with TipTap: bold, italic, underline, H1/H2/H3 headings, bullet lists, and numbered lists
-- Autosave with conflict detection using document `version` numbers
+- Automatic content saves after 800 ms of inactivity, with conflict detection using document `version` numbers
 - Document access model with `owner`, `editor`, and `viewer` roles
 - Owner-only share controls for assigning or revoking access
 - Imported `.txt` and `.md` content converted into the app's sanitized document JSON
+- Document comments for owners and editors, visible to users with read access
+- Version history with snapshot preview and restore
+- Separate automatic history snapshots after 10 seconds without edits, with a server-enforced 30-second minimum interval and duplicate prevention
+- One `Export as` menu for `.txt`, `.md`, and `.pdf` downloads
 - Seeded demo users for local testing and permission checks
 
 ## Technology stack
@@ -142,9 +146,11 @@ No live URL, production endpoint, or deployment manifest was found in the reposi
 ## Known limitations and unfinished setup steps
 
 - Authentication is demo-user based and not a full password system.
-- The app supports only `.txt` and `.md` imports; no PDF export or richer import types are implemented.
+- The app supports only `.txt` and `.md` imports; PDF import is not implemented.
 - Sharing supports only `owner`, `editor`, and `viewer` roles.
-- Real-time collaboration, comments, suggestion mode, and version history are not implemented.
+- Real-time collaborative editing and suggestion mode are not implemented.
+- The history API returns the latest 25 snapshots. Automatic snapshots require the editor to remain open until the inactivity timer runs; a recent autosave may not yet have a history entry if the page closes first.
+- PDF export is lightweight: very long documents may not paginate, and some formatting such as underline may not match the editor exactly.
 - The project includes automated tests.
 
 ## Summary

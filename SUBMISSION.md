@@ -2,7 +2,7 @@
 
 Docraft is a lightweight collaborative document editor built with Next.js, React, TypeScript, TipTap, and MongoDB. This document describes the implemented functionality and identifies the optional enhancements planned for the assessment.
 
-## 1. Implemented and Manually Verified
+## 1. Implemented Features
 
 The following core features have been implemented and manually tested in the application.
 
@@ -11,7 +11,7 @@ The following core features have been implemented and manually tested in the app
 - Create documents.
 - Rename and delete existing documents.
 - Edit and reopen documents.
-- Save document changes and persist them across browser refreshes.
+- Automatically save document changes after approximately 800 ms of inactivity and persist them across browser refreshes.
 - Display document ownership and editing status in the editor toolbar.
 
 ### Rich-Text Editing
@@ -21,12 +21,21 @@ The following core features have been implemented and manually tested in the app
 - Bulleted and numbered lists.
 - Persist document content and formatting.
 
+### Comments and Version History
+
+- Add document-level comments as an owner or editor; users with read access can view them.
+- Create automatic history snapshots after approximately 10 seconds without edits, independently of the content autosave.
+- Enforce a minimum 30-second interval between automatic snapshots on the server and skip snapshots when normalized title and content are unchanged.
+- Preview a saved version in a read-only popup or restore it as the current document.
+
 ### Import and Export
 
 - Import plain-text (`.txt`) files.
 - Import Markdown (`.md`) files.
 - Validate supported import formats.
 - Export documents as plain text (`.txt`).
+- Export Markdown (`.md`) with document structure and supported formatting.
+- Export PDF (`.pdf`) with headings and list structure through the single `Export as` menu.
 - Supported import formats: `.txt` and `.md`. DOCX and PDF import are not currently supported.
 
 ### Sharing and Access Control
@@ -41,7 +50,7 @@ The following core features have been implemented and manually tested in the app
 
 - Validate incoming data and document content.
 - Handle invalid input and API errors.
-- Include automated tests for access control, content validation, and Markdown/plain-text import conversion.
+- Include automated tests for access control, content validation, import conversion, PDF generation, and version-history policies including debounce reset, duplicate checks, the minimum interval, and restore no-op behavior.
 
 ## 2. Documentation Deliverables
 
@@ -54,20 +63,18 @@ These files document the project and its implementation:
 
 Before submission, ensure that the setup instructions, AI workflow details, and test commands accurately reflect the final project.
 
-## 3. Optional Stretch Features
+## 3. Remaining Optional Scope
 
-The following features are enhancements beyond the core assessment requirements. Their status must be updated after implementation and testing.
+These features are not implemented:
 
-- Markdown export.
-- Document-level commenting.
-- Document version history with the ability to inspect and restore earlier versions.
 - Real-time collaboration indicators.
 - Additional sharing permissions beyond the existing owner, editor, and viewer roles.
 
 ## 4. Known Scope and Limitations
 
 - Import currently supports `.txt` and `.md` files, not DOCX or PDF.
-- Export currently supports plain text; Markdown export is a planned enhancement.
-- The existing document version counter is used for save/version conflict handling. It should not be described as user-accessible version history unless historical snapshots and restoration are implemented.
+- The editor's numeric document version is used for save-conflict detection; historical snapshots are stored separately.
+- The history API returns the latest 25 snapshots. Automatic snapshots require the editor's inactivity timer to run; autosaved changes may not yet have a history entry if the page closes first.
+- PDF export is lightweight and may not paginate very long documents or reproduce every formatting detail, such as underline, exactly.
 - Real-time collaborative editing and live cursor or presence indicators are not included in the current core implementation.
-- Comments and suggestion mode are not included in the current core implementation.
+- Suggestion mode is not included in the current implementation.
