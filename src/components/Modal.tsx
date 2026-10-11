@@ -10,10 +10,12 @@ export default function Modal({
   title,
   onClose,
   children,
+  panelClassName = "max-w-md",
 }: {
   title: string;
   onClose: () => void;
   children: React.ReactNode;
+  panelClassName?: string;
 }) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -67,7 +69,7 @@ export default function Modal({
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        className="w-full max-w-md rounded-lg border border-line bg-surface p-5 shadow-lg"
+        className={`w-full ${panelClassName} rounded-lg border border-line bg-surface p-5 shadow-lg`}
       >
         <h2 id={titleId} className="font-serif text-xl font-semibold">
           {title}

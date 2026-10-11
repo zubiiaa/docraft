@@ -5,13 +5,17 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EditorContent, useEditor, useEditorState, type Editor, type JSONContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import Modal from "@/components/Modal";
 import ShareDialog from "@/components/ShareDialog";
-import { api, displayName, errorMessage, HttpError } from "@/lib/client";
+import { buildPdfBlob } from "@/lib/pdf";
+import { api, displayName, errorMessage, HttpError, timeAgo } from "@/lib/client";
+import { cancelDebouncedTask, scheduleDebouncedTask } from "@/lib/debounce";
 import type { DocDto, ShareRow } from "@/lib/types";
 
 type SaveStatus = "saved" | "unsaved" | "saving" | "error" | "conflict";
 
 const DEBOUNCE_MS = 800;
+const SNAPSHOT_DEBOUNCE_MS = 10_000;
 const RETRY_MS = 5000;
 
 function extractText(node: unknown): string {
@@ -24,6 +28,69 @@ function extractText(node: unknown): string {
 function countWords(text: string): number {
   const t = text.trim();
   return t ? t.split(/\s+/).length : 0;
+}
+
+function escapeMarkdownInline(text: string): string {
+  return text.replace(/([\\`*_{}\[\]()#+\-.!])/g, "\\$1");
+}
+
+function renderInlineMarkdown(content: unknown[] = []): string {
+  return (content ?? [])
+    .map((node: unknown) => {
+      if (!node || typeof node !== "object") return "";
+      const item = node as { type?: string; text?: string; marks?: { type?: string }[]; content?: unknown[] };
+      if (item.type === "text") {
+        let text = item.text ?? "";
+        const marks = item.marks ?? [];
+        if (marks.some((mark) => mark.type === "bold")) text = `**${text}**`;
+        if (marks.some((mark) => mark.type === "italic")) text = `*${text}*`;
+        if (marks.some((mark) => mark.type === "underline")) text = `<u>${text}</u>`;
+        return escapeMarkdownInline(text);
+      }
+      if (item.type === "hardBreak") return "  \n";
+      if (Array.isArray(item.content)) return renderInlineMarkdown(item.content);
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+function renderListItemMarkdown(item: unknown): string {
+  if (!item || typeof item !== "object") return "";
+  const listItem = item as { content?: unknown[] };
+  return renderInlineMarkdown(listItem.content ?? []).replace(/\n+/g, " ").trim();
+}
+
+function renderMarkdownDocument(doc: unknown): string {
+  if (!doc || typeof doc !== "object") return "";
+  const container = doc as { type?: string; content?: unknown[]; attrs?: { level?: number; start?: number } };
+  const blocks = (container.content ?? [])
+    .map((node: unknown) => {
+      if (!node || typeof node !== "object") return "";
+      const item = node as { type?: string; attrs?: { level?: number; start?: number }; content?: unknown[] };
+      switch (item.type) {
+        case "heading": {
+          const level = Math.min(Math.max(Number(item.attrs?.level ?? 1), 1), 6);
+          return `${"#".repeat(level)} ${renderInlineMarkdown(item.content ?? [])}`;
+        }
+        case "paragraph":
+          return renderInlineMarkdown(item.content ?? []);
+        case "bulletList":
+          return (item.content ?? []).map((listItem) => `- ${renderListItemMarkdown(listItem)}`).join("\n");
+        case "orderedList": {
+          const start = Math.max(1, Number(item.attrs?.start ?? 1));
+          return (item.content ?? [])
+            .map((listItem, index) => `${start + index}. ${renderListItemMarkdown(listItem)}`)
+            .join("\n");
+        }
+        default:
+          return "";
+      }
+    })
+    .filter(Boolean)
+    .join("\n\n");
+
+  return blocks.trim();
 }
 
 function ToolbarButton({
@@ -136,6 +203,63 @@ function Toolbar({ editor, disabled }: { editor: Editor | null; disabled: boolea
   );
 }
 
+type CommentEntry = {
+  id: string;
+  text: string;
+  createdAt: string;
+  author: { id: string; name: string };
+};
+
+type VersionEntry = {
+  id: string;
+  title: string;
+  createdAt: string;
+  createdBy: { id: string; name: string };
+  content: unknown;
+};
+
+function VersionPreview({ version, onClose }: { version: VersionEntry; onClose: () => void }) {
+  const editor = useEditor({
+    extensions: [
+      StarterKit.configure({
+        heading: { levels: [1, 2, 3] },
+        blockquote: false,
+        code: false,
+        codeBlock: false,
+        horizontalRule: false,
+        strike: false,
+        link: false,
+      }),
+    ],
+    content: version.content as JSONContent,
+    editable: false,
+    immediatelyRender: false,
+    editorProps: {
+      attributes: { class: "docraft-prose min-h-0", "aria-label": "Version preview content" },
+    },
+  });
+
+  return (
+    <Modal title={version.title} onClose={onClose} panelClassName="max-w-4xl">
+      <div className="mb-3 text-xs text-muted">
+        Saved by {displayName(version.createdBy.name)} · {new Date(version.createdAt).toLocaleString()}
+      </div>
+      <div className="max-h-[70vh] overflow-y-auto rounded border border-line bg-canvas px-5 py-4 sm:px-8">
+        <EditorContent editor={editor} />
+      </div>
+      <div className="mt-4 flex justify-end">
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded border border-line px-3 py-1.5 text-sm hover:bg-canvas"
+        >
+          Close
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 export default function DocumentEditor({ initial }: { initial: DocDto }) {
   const router = useRouter();
   const canEdit = initial.role === "owner" || initial.role === "editor";
@@ -147,7 +271,14 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
   const [words, setWords] = useState(() => countWords(extractText(initial.content)));
   const [shares, setShares] = useState<ShareRow[]>(initial.shares ?? []);
   const [shareOpen, setShareOpen] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
   const [titleMsg, setTitleMsg] = useState("");
+  const [comments, setComments] = useState<CommentEntry[]>([]);
+  const [commentText, setCommentText] = useState("");
+  const [commentError, setCommentError] = useState("");
+  const [versions, setVersions] = useState<VersionEntry[]>([]);
+  const [previewVersion, setPreviewVersion] = useState<VersionEntry | null>(null);
+  const [historyError, setHistoryError] = useState("");
 
   // Autosave bookkeeping lives in refs: it must not trigger re-renders.
   const versionRef = useRef(initial.version); // last version the server confirmed
@@ -155,15 +286,25 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
   const inFlightRef = useRef(false); // at most ONE save request at a time
   const conflictRef = useRef(false); // server said our base version is stale
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const snapshotTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const snapshotGenerationRef = useRef(0);
+  const snapshotRef = useRef<(generation: number) => Promise<void>>(async () => {});
   const savedTitleRef = useRef(initial.title);
   const flushRef = useRef<() => Promise<void>>(async () => {});
+
+  const scheduleSnapshot = useCallback(() => {
+    if (!canEdit) return;
+    const generation = ++snapshotGenerationRef.current;
+    scheduleDebouncedTask(snapshotTimerRef, () => void snapshotRef.current(generation), SNAPSHOT_DEBOUNCE_MS);
+  }, [canEdit]);
 
   const scheduleSave = useCallback(() => {
     dirtyRef.current = true;
     setStatus("unsaved");
     if (timerRef.current) clearTimeout(timerRef.current);
     timerRef.current = setTimeout(() => void flushRef.current(), DEBOUNCE_MS);
-  }, []);
+    scheduleSnapshot();
+  }, [scheduleSnapshot]);
 
   const editor = useEditor({
     extensions: [
@@ -228,6 +369,41 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
     };
   });
 
+  useEffect(() => {
+    snapshotRef.current = async (generation) => {
+      if (!editor || !canEdit || conflictRef.current || generation !== snapshotGenerationRef.current) return;
+      if (dirtyRef.current || inFlightRef.current) {
+        scheduleDebouncedTask(snapshotTimerRef, () => void snapshotRef.current(generation), 1000);
+        return;
+      }
+
+      try {
+        const result = await api<{ created: boolean; retryAfterMs: number }>(
+          `/api/documents/${initial.id}/history/snapshot`,
+          {
+            method: "POST",
+            body: { title: title.trim(), content: editor.getJSON(), baseVersion: versionRef.current },
+          },
+        );
+        if (generation !== snapshotGenerationRef.current) return;
+        if (result.created) void loadHistory();
+        else if (result.retryAfterMs > 0) {
+          scheduleDebouncedTask(
+            snapshotTimerRef,
+            () => void snapshotRef.current(generation),
+            result.retryAfterMs,
+          );
+        }
+      } catch (error) {
+        if (generation !== snapshotGenerationRef.current) return;
+        setHistoryError(errorMessage(error, "Could not save version history"));
+        if (!(error instanceof HttpError && error.status >= 400 && error.status < 500)) {
+          scheduleDebouncedTask(snapshotTimerRef, () => void snapshotRef.current(generation), RETRY_MS);
+        }
+      }
+    };
+  });
+
   // Warn before closing the tab with unsaved work; flush when the tab is hidden.
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -242,6 +418,7 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
       window.removeEventListener("beforeunload", onBeforeUnload);
       document.removeEventListener("visibilitychange", onVisibility);
       if (timerRef.current) clearTimeout(timerRef.current);
+      cancelDebouncedTask(snapshotTimerRef);
     };
   }, []);
 
@@ -278,6 +455,7 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
       savedTitleRef.current = t;
       setTitle(t);
       setTitleMsg("Renamed");
+      scheduleSnapshot();
     } catch (e) {
       setTitleMsg(errorMessage(e, "Could not rename"));
     }
@@ -291,6 +469,17 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
     const a = document.createElement("a");
     a.href = url;
     a.download = `${title.replace(/[^\w\- ]+/g, "").trim() || "document"}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportPdf() {
+    if (!editor) return;
+    const blob = buildPdfBlob(title, editor.getJSON());
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title.replace(/[^\w\- ]+/g, "").trim() || "document"}.pdf`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -318,6 +507,78 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
       : `Shared with ${shares.length} ${shares.length === 1 ? "person" : "people"}`
     : `Owned by ${displayName(initial.owner.name)}`;
 
+  async function loadComments() {
+    try {
+      const r = await api<{ comments: CommentEntry[] }>(`/api/documents/${initial.id}/comments`);
+      setComments(r.comments);
+      setCommentError("");
+    } catch (e) {
+      setCommentError(errorMessage(e, "Could not load comments"));
+    }
+  }
+
+  async function loadHistory() {
+    try {
+      const r = await api<{ versions: VersionEntry[] }>(`/api/documents/${initial.id}/history`);
+      setVersions(r.versions);
+      setHistoryError("");
+    } catch (e) {
+      setHistoryError(errorMessage(e, "Could not load version history"));
+    }
+  }
+
+  useEffect(() => {
+    void loadComments();
+    void loadHistory();
+  }, [initial.id]);
+
+  async function submitComment(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canEdit) return;
+    const text = commentText.trim();
+    if (!text) {
+      setCommentError("Comment cannot be empty.");
+      return;
+    }
+    try {
+      const r = await api<{ comment: CommentEntry }>(`/api/documents/${initial.id}/comments`, {
+        method: "POST",
+        body: { text },
+      });
+      setComments((current) => [r.comment, ...current]);
+      setCommentText("");
+      setCommentError("");
+    } catch (e) {
+      setCommentError(errorMessage(e, "Could not add comment"));
+    }
+  }
+
+  async function restoreVersion(snapshotId: string) {
+    if (!window.confirm("Restore this snapshot and replace the current document content?")) return;
+    try {
+      await api(`/api/documents/${initial.id}/history`, {
+        method: "POST",
+        body: { snapshotId },
+      });
+      window.location.reload();
+    } catch (e) {
+      setHistoryError(errorMessage(e, "Could not restore the selected version"));
+    }
+  }
+
+  function exportMarkdown() {
+    if (!editor) return;
+    const raw = renderMarkdownDocument(editor.getJSON());
+    const text = `${title.trim() ? `# ${title.trim()}\n\n` : ""}${raw ? `${raw}\n` : ""}`.trimEnd() + "\n";
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title.replace(/[^\w\- ]+/g, "").trim() || "document"}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <>
       <header className="sticky top-0 z-10 border-b border-line bg-surface">
@@ -334,7 +595,10 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
               value={title}
               readOnly={!canEdit}
               maxLength={200}
-              onChange={(e) => setTitle(e.target.value)}
+              onChange={(e) => {
+                setTitle(e.target.value);
+                scheduleSnapshot();
+              }}
               onBlur={() => void saveTitle()}
               onKeyDown={(e) => {
                 if (e.key === "Enter") (e.target as HTMLInputElement).blur();
@@ -363,13 +627,49 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
                 Retry
               </button>
             )}
-            <button
-              type="button"
-              onClick={exportText}
-              className="rounded border border-line px-3 py-1.5 text-sm hover:bg-canvas"
-            >
-              Export .txt
-            </button>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setExportMenuOpen((open) => !open)}
+                className="rounded border border-line px-3 py-1.5 text-sm hover:bg-canvas"
+              >
+                Export as
+              </button>
+              {exportMenuOpen && (
+                <div className="absolute right-0 z-20 mt-2 min-w-32 rounded-md border border-line bg-surface shadow-sm">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExportMenuOpen(false);
+                      exportText();
+                    }}
+                    className="block w-full px-3 py-2 text-left text-sm hover:bg-canvas"
+                  >
+                    .txt
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExportMenuOpen(false);
+                      exportMarkdown();
+                    }}
+                    className="block w-full px-3 py-2 text-left text-sm hover:bg-canvas"
+                  >
+                    .md
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setExportMenuOpen(false);
+                      exportPdf();
+                    }}
+                    className="block w-full px-3 py-2 text-left text-sm hover:bg-canvas"
+                  >
+                    .pdf
+                  </button>
+                </div>
+              )}
+            </div>
             {isOwner && (
               <button
                 type="button"
@@ -416,6 +716,97 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
         <article className="min-h-[70vh] rounded-sm border border-line bg-surface px-5 py-8 shadow-sm focus-within:border-accent/40 sm:px-14 sm:py-12">
           <EditorContent editor={editor} />
         </article>
+
+        <div className="mt-8 grid items-start gap-6 lg:grid-cols-2">
+          <section className="rounded-md border border-line bg-surface p-4">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Comments</h2>
+              <span className="text-xs text-muted">{comments.length}</span>
+            </div>
+
+            {comments.length === 0 ? (
+              <p className="text-sm text-muted">No comments yet.</p>
+            ) : (
+              <ul className="space-y-3">
+                {comments.map((comment) => (
+                  <li key={comment.id} className="rounded border border-line bg-canvas p-3">
+                    <div className="mb-1 flex items-center justify-between gap-2 text-xs text-muted">
+                      <span className="font-medium text-ink">{displayName(comment.author.name)}</span>
+                      <time dateTime={comment.createdAt}>{timeAgo(comment.createdAt)}</time>
+                    </div>
+                    <p className="whitespace-pre-wrap text-sm leading-6">{comment.text}</p>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            {canEdit && (
+              <form onSubmit={submitComment} className="mt-4 space-y-2">
+                <label htmlFor="comment-text" className="sr-only">
+                  Add a comment
+                </label>
+                <textarea
+                  id="comment-text"
+                  value={commentText}
+                  onChange={(e) => setCommentText(e.target.value)}
+                  rows={3}
+                  maxLength={4000}
+                  placeholder="Add a comment for this document"
+                  className="w-full rounded-md border border-line bg-canvas px-3 py-2 text-sm focus:border-accent"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted">{commentText.trim().length}/4000</span>
+                  <button type="submit" className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white hover:opacity-90">
+                    Add comment
+                  </button>
+                </div>
+                {commentError && <p className="text-sm text-danger">{commentError}</p>}
+              </form>
+            )}
+          </section>
+
+          <section className="rounded-md border border-line bg-surface p-4">
+            <div className="mb-3 flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Versions</h2>
+              <span className="text-xs text-muted">{versions.length}</span>
+            </div>
+
+            {historyError ? (
+              <p className="text-sm text-danger">{historyError}</p>
+            ) : versions.length === 0 ? (
+              <p className="text-sm text-muted">No saved versions yet.</p>
+            ) : (
+              <ul className="space-y-3">
+                {versions.map((version) => (
+                  <li key={version.id} className="rounded border border-line bg-canvas p-3">
+                    <div className="mb-2 flex items-center justify-between gap-2 text-xs text-muted">
+                      <span className="font-medium text-ink">{displayName(version.createdBy.name)}</span>
+                      <time dateTime={version.createdAt}>{timeAgo(version.createdAt)}</time>
+                    </div>
+                    <p className="text-sm font-medium">{version.title}</p>
+                    <div className="mt-3 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setPreviewVersion(version)}
+                        className="rounded border border-line px-2 py-1 text-xs hover:bg-stone-100"
+                      >
+                        Preview
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void restoreVersion(version.id)}
+                        disabled={!canEdit}
+                        className="rounded border border-line px-2 py-1 text-xs hover:bg-stone-100 disabled:opacity-60"
+                      >
+                        Restore
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
       </main>
 
       {shareOpen && (
@@ -427,6 +818,7 @@ export default function DocumentEditor({ initial }: { initial: DocDto }) {
           onClose={() => setShareOpen(false)}
         />
       )}
+      {previewVersion && <VersionPreview version={previewVersion} onClose={() => setPreviewVersion(null)} />}
     </>
   );
 }

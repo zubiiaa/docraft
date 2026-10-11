@@ -27,4 +27,12 @@ export const shareSchema = z.object({
   role: z.enum(["viewer", "editor"], { message: "Role must be viewer or editor" }),
 });
 
+export const commentSchema = z.object({
+  text: z.string().trim().min(1, "Comment cannot be empty").max(4000, "Comment is too long"),
+});
+
+export const restoreVersionSchema = z.object({
+  snapshotId: objectId,
+});
+
 export const OBJECT_ID_RE = /^[a-f\d]{24}$/i;

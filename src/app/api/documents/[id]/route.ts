@@ -32,6 +32,7 @@ export async function PATCH(req: Request, { params }: Ctx) {
 
     const body = await parseBody(req, patchDocSchema);
 
+    await connectDB();
     let content;
     if (body.content !== undefined) {
       try {
@@ -64,7 +65,6 @@ export async function PATCH(req: Request, { params }: Ctx) {
       ...(content ? { $inc: { version: 1 } } : {}),
     };
 
-    await connectDB();
     const updated = await DocumentModel.findOneAndUpdate(filter, update, { new: true })
       .select("title version updatedAt")
       .lean();
